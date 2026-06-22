@@ -1,5 +1,5 @@
 {
-  "last_testcase_commit": "df2283d877b727784d2119e21923cdc88aa6f63a",
+  "last_testcase_commit": "03899228e2cf2e2f181cb9422f97e30d88dd6681",
   "last_update_date": "2026-06-18",
-  "last_update_summary": "Synced with test case commit df2283d87. Deleted 5 test cases (kimi_k2_6 2x24p, minimax_m2_5 3x), renamed 3 (glm5_1, minimax_m2_5 aime25→gpqa), modified 14. Added <a> anchor tags for deploy mode categories. Auto-completed PD disaggregation params (--disaggregation-transfer-backend, --trust-remote-code, --attention-backend, --device)."
+  "last_update_summary": "Synced with test case commit 03899228. Deleted 5 test cases (kimi_k2_6 2x24p, minimax_m2_5 3x), renamed 3 (glm5_1, minimax_m2_5 aime25→gpqa), modified 14. Added <a> anchor tags (pd-disaggregation/single-node-pd-mixed/multi-node-pd-mixed). Fixed is_multi_node to use actual --nnodes value. Fixed quantization to BF16 when no --quantization arg. Auto-completed PD disaggregation params."
 }

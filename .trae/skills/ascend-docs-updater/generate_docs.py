@@ -40,7 +40,7 @@ def parse_quantization(filename):
         return "W8A8 INT8"
     elif "bf16" in name:
         return "BF16"
-    return "W8A8 INT8"
+    return "BF16"
 
 
 def parse_deploy_mode(filename, is_multi_node):
@@ -395,6 +395,31 @@ def extract_config_from_file(filepath):
         # Found a performance class, stop searching
         break
 
+    # Determine is_multi_node based on actual --nnodes value, not class inheritance
+    def _get_nnodes(args_list):
+        for i, a in enumerate(args_list):
+            if isinstance(a, str) and a == "--nnodes" and i + 1 < len(args_list):
+                val = args_list[i + 1]
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    pass
+        return 1
+
+    if config["is_pd_separate"]:
+        pf_nn = _get_nnodes(config.get("prefill_args", []))
+        dc_nn = _get_nnodes(config.get("decode_args", []))
+        config["is_multi_node"] = (pf_nn > 1 or dc_nn > 1)
+    else:
+        nn = _get_nnodes(config.get("other_args", []))
+        config["is_multi_node"] = (nn > 1)
+
+    # Override quantization: if no --quantization in args, it's BF16
+    all_args = (config.get("prefill_args", []) + config.get("decode_args", []) +
+                config.get("other_args", []))
+    if "--quantization" not in all_args:
+        config["quantization"] = "BF16"
+
     return config
 
 
@@ -532,6 +557,23 @@ def format_pd_separate_command(config):
     decode_args = strip_flag(decode_args, "--disaggregation-mode")
     prefill_args = strip_flag(prefill_args, "--node-rank")
     decode_args = strip_flag(decode_args, "--node-rank")
+
+    if "--disaggregation-transfer-backend" not in prefill_args:
+        prefill_args.extend(["--disaggregation-transfer-backend", "ascend"])
+    if "--disaggregation-transfer-backend" not in decode_args:
+        decode_args.extend(["--disaggregation-transfer-backend", "ascend"])
+    if "--trust-remote-code" not in prefill_args:
+        prefill_args.append("--trust-remote-code")
+    if "--trust-remote-code" not in decode_args:
+        decode_args.append("--trust-remote-code")
+    if "--attention-backend" not in prefill_args:
+        prefill_args.extend(["--attention-backend", "ascend"])
+    if "--attention-backend" not in decode_args:
+        decode_args.extend(["--attention-backend", "ascend"])
+    if "--device" not in prefill_args:
+        prefill_args.extend(["--device", "npu"])
+    if "--device" not in decode_args:
+        decode_args.extend(["--device", "npu"])
 
     prefill_args_str = format_args_for_bash(prefill_args, indent="        ")
     decode_args_str = format_args_for_bash(decode_args, indent="        ")
@@ -785,7 +827,31 @@ def format_single_node_command(config):
         del envs_filtered["PYTHONPATH"]
 
     env_block = format_env_exports(envs_filtered)
-    args_str = format_args_for_bash(other_args, indent="    ")
+
+    nnodes = 1
+    for i, arg in enumerate(other_args):
+        if arg == "--nnodes" and i + 1 < len(other_args):
+            try:
+                nnodes = int(other_args[i + 1])
+            except (ValueError, TypeError):
+                pass
+
+    is_multi_node = nnodes > 1
+
+    if is_multi_node:
+        new_args = []
+        skip_next = False
+        for a in other_args:
+            if skip_next:
+                skip_next = False
+                continue
+            if a == "--nnodes":
+                skip_next = True
+                continue
+            new_args.append(a)
+        args_str = format_args_for_bash(new_args, indent="        ")
+    else:
+        args_str = format_args_for_bash(other_args, indent="    ")
 
     has_draft = "--speculative-draft-model-path" in other_args
 
@@ -794,6 +860,8 @@ def format_single_node_command(config):
     ]
     if has_draft:
         comment_items.append("#   DRAFT_MODEL_PATH: path to the draft model weights directory")
+    if is_multi_node:
+        comment_items.append("#   NODE_IPS: IP addresses of each node in the cluster")
     comment_items += [
         "#   HCCL_SOCKET_IFNAME: network interface name for HCCL",
         "#   GLOO_SOCKET_IFNAME: network interface name for Gloo",
@@ -813,7 +881,52 @@ def format_single_node_command(config):
     else:
         draft_var = ""
 
-    cmd = f"""{header}
+    if is_multi_node:
+        ips = " ".join(f"'<your node{i+1} ip>'" for i in range(nnodes))
+        cmd = f"""{header}
+
+MODEL_PATH=/path/to/model-weights
+{draft_var}NODE_IPS=({ips})
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+{env_block}
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{{print$1}}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{{print$2}}'`
+echo "${{LOCAL_HOST1}}"
+echo "${{LOCAL_HOST2}}"
+
+for i in "${{!NODE_IPS[@]}}";
+do
+    if [[ "$LOCAL_HOST1" == "${{NODE_IPS[$i]}}" || "$LOCAL_HOST2" == "${{NODE_IPS[$i]}}" ]];
+    then
+        echo "${{NODE_IPS[$i]}}"
+        python3 -m sglang.launch_server \\
+        --model-path $MODEL_PATH \\
+        --host ${{NODE_IPS[$i]}} --port 6688 \\
+        --nnodes {nnodes} \\
+        --dist-init-addr ${{NODE_IPS[0]}}:5000 \\
+        --node-rank $i \\
+        {args_str}
+        break
+    fi
+done
+"""
+    else:
+        cmd = f"""{header}
 
 MODEL_PATH=/path/to/model-weights
 {draft_var}echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
@@ -992,16 +1105,30 @@ def build_model_document(model_dir, configs):
     write_table(high_throughput, "High Throughput")
 
     # Optimal Configuration sections
-    lines.append("")
     lines.append("## Optimal Configuration")
     lines.append("")
 
+    seen_anchor_types = set()
     for c in configs:
         bm = c.get("benchmark", {})
         dataset = parse_dataset_from_filename(c.get("filename", ""))
         tpot_val = bm.get("tpot", "N/A")
         tpot_str = f"{tpot_val}ms" if tpot_val != "N/A" else "N/A"
         heading_label = generate_heading_label(c, model_name, model_dir)
+
+        is_sep = c.get("is_pd_separate", False)
+        is_multi = c.get("is_multi_node", False)
+        if is_sep:
+            anchor_type = "pd-disaggregation"
+        elif is_multi:
+            anchor_type = "multi-node-pd-mixed"
+        else:
+            anchor_type = "single-node-pd-mixed"
+
+        if anchor_type not in seen_anchor_types:
+            lines.append(f'<a id="{anchor_type}" title="Referenced by external docs. Verify before removing."></a>')
+            lines.append("")
+            seen_anchor_types.add(anchor_type)
 
         lines.append(f"### {heading_label}")
         lines.append("")
