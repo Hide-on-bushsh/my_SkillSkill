@@ -21,6 +21,7 @@ description: "Updates Ascend NPU best practice docs from test cases. Invoke when
 - 输出目录: `c:\Users\xujianzhao\Desktop\sglang\docs_new\docs\hardware-platforms\ascend-npus\best_practice\`
 - 版本追踪: `c:\Users\xujianzhao\Desktop\sglang\docs_new\docs\hardware-platforms\ascend-npus\best_practice\doc_version.json`
 - 锚点检查: `c:\Users\xujianzhao\Desktop\sglang\_check_anchors.js`
+- 站点导航: `c:\Users\xujianzhao\Desktop\sglang\docs_new\docs.json`
 
 ## 工作流程
 
@@ -122,6 +123,21 @@ cd c:\Users\xujianzhao\Desktop\sglang; git diff docs_new/docs/hardware-platforms
 | 修改: test_npu_yyy.py (环境变量变更) | yyy.mdx 更新环境变量 | ✅ | ⚠️ --tp-size 用例=8 文档=4 | ⚠️ 参数不一致 |
 | 删除: test_npu_zzz.py | zzz.mdx 删除段落 | ✅ | - | ✅ 匹配 |
 | (无) | www.mdx 意外变更 | - | - | ⚠️ 需排查 |
+
+### 第 7-2 步：同步 docs.json 导航
+
+best_practice 目录下的 .mdx 增加或删除时，需要同步更新 `docs.json` 中 "Best Practice" group 的 pages 列表。
+
+读取 `docs.json`，找到 `navigation -> tabs -> groups -> pages` 中 `"group": "Best Practice"` 的节点，将其 `pages` 数组替换为当前 best_practice 目录下所有 .mdx 文件（不含扩展名）按字母序排列的列表，路径前缀为 `docs/hardware-platforms/ascend-npus/best_practice/`。
+
+实现逻辑：
+1. 扫描 `c:\Users\xujianzhao\Desktop\sglang\docs_new\docs\hardware-platforms\ascend-npus\best_practice\` 下所有 `*.mdx` 文件，排序得到 slug 列表
+2. 构造 `expected_pages = [f"docs/hardware-platforms/ascend-npus/best_practice/{slug}" for slug in slugs]`
+3. 加载 `docs.json`，递归遍历整个 JSON 树，找到 `"group": "Best Practice"` 且含 `"pages"` 的 dict，对比 `pages` 与 `expected_pages`
+4. 如果不一致，用 `expected_pages` 替换并写回（保持原有 indent 2、ensure_ascii=False）
+5. 如果没有找到 "Best Practice" group，不修改 `docs.json`
+
+写回时用 `json.dump(obj, f, indent=2, ensure_ascii=False)` 保持格式兼容。
 
 ### 第 8 步：确认
 

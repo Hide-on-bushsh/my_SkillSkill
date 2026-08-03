@@ -12,8 +12,10 @@ OUTPUT_DIR = r"c:\Users\xujianzhao\Desktop\sglang\docs_new\docs\hardware-platfor
 MODEL_DISPLAY_NAMES = {
     "deepseek_r1": "DeepSeek-R1",
     "deepseek_v3_2": "DeepSeek-V3.2",
+    "deepseek_v4_flash": "DeepSeek-V4-Flash",
     "glm5_1": "GLM-5.1",
     "kimi_k2_6": "Kimi-K2.6",
+    "mimo_v2_flash": "MiMo-V2-Flash",
     "minimax_m2_5": "MiniMax-M2.5",
     "qwen3-8b": "Qwen3-8B",
     "qwen3_235b_a22b": "Qwen3-235B-A22B",
@@ -23,6 +25,32 @@ MODEL_DISPLAY_NAMES = {
     "qwen3_6_27b": "Qwen3.6-27B",
     "qwen3_6_35b_a3b": "Qwen3.6-35B-A3B",
     "qwen3_next_80b_a3b_instruct": "Qwen3-Next-80B-A3B-Instruct",
+}
+
+# Slug override for model tutorial pages whose filename differs from model_dir.
+# Keys are model_dir names; values are the corresponding tutorial slug (filename
+# without extension) under docs/hardware-platforms/ascend-npus/model-tutorials/.
+MODEL_TUTORIAL_SLUG_OVERRIDES = {
+    "glm5_1": "glm_5_1",
+}
+
+
+def get_tutorial_slug(model_dir):
+    """Return the model-tutorials slug for a given model_dir."""
+    return MODEL_TUTORIAL_SLUG_OVERRIDES.get(model_dir, model_dir)
+
+
+# CLI args to exclude from generated documentation (e.g. internal paths, debug flags).
+EXCLUDED_ARGS = {
+    "--init-expert-location",
+}
+
+# Env vars to exclude from generated documentation (development / debugging only).
+EXCLUDED_ENV_VARS = {
+    "SGLANG_NPU_PROFILING",
+    "SGLANG_NPU_PROFILING_STAGE",
+    "SGLANG_NPU_PROFILING_BS",
+    "SGLANG_PROFILE_WITH_STACK",
 }
 
 
@@ -59,7 +87,7 @@ def safe_val(val):
 
 
 def parse_dataset_from_filename(filename):
-    """Extract dataset string from filename like in128k_out1k → 128K+1K, with optional prefix suffix."""
+    """Extract dataset string from filename like in128k_out1k → 128k+1k, with optional prefix suffix."""
     m = re.search(r'_in([\d.kpqx_]+)_out([\d.k]+)(?:[_\.]|$)', filename.lower())
     if m:
         inp = m.group(1).rstrip("_")
@@ -76,10 +104,10 @@ def parse_dataset_from_filename(filename):
                     return f"{m2.group(1)} ({m2.group(2)})"
                 return s
             if "k" in s.lower():
-                s = re.sub(r'^(\d+)k(\d+)', r'\1.\2K', s)
-                if s.endswith("K"):
+                s = re.sub(r'^(\d+)k(\d+)', r'\1.\2k', s)
+                if s.endswith("k"):
                     return s
-                return s[:-1] + "K"
+                return s[:-1] + "k"
             return s
         return f"{fmt(inp)}+{fmt(out)}{suffix}"
     return ""
@@ -357,26 +385,29 @@ def extract_config_from_file(filepath):
         # Strip docstrings to avoid matching content inside them
         class_body_clean = re.sub(r'""".*?"""', '', class_body, flags=re.DOTALL)
 
-        for field in ["max_concurrency", "num_prompts", "input_len", "output_len",
-                       "random_range_ratio", "tpot", "mean_e2e_latency",
-                       "output_token_throughput",
-                       "request_rate", "warmup_requests", "dataset_name", "repeat_rate",
-                       "backend", "image_count", "image_resolution"]:
-            m = re.search(rf'{field}\s*=\s*([^\n]+)', class_body_clean)
-            if m:
-                val = m.group(1).strip()
-                # Strip surrounding quotes
-                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-                    val = val[1:-1]
-                try:
-                    if "." in val and re.match(r'^-?[\d.]+$', val):
-                        bm[field] = float(val)
-                    elif val.isdigit():
-                        bm[field] = int(val)
-                    else:
-                        bm[field] = val
-                except:
+        # Dynamically extract all ``identifier = value`` assignments from the
+        # class body (instead of a hardcoded list).  Only skip known config
+        # plumbing fields that are never benchmark parameters.
+        _non_bm_fields = {"model_config", "benchmark_tool", "dataset_type",
+                          "model", "model_path", "other_args", "envs",
+                          "other_envs", "model_type"}
+        for m in re.finditer(r'^\s*(\w+)\s*=\s*([^\n]+)', class_body_clean, re.MULTILINE):
+            field = m.group(1)
+            if field in _non_bm_fields:
+                continue
+            val = m.group(2).strip()
+            # Strip surrounding quotes
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                val = val[1:-1]
+            try:
+                if "." in val and re.match(r'^-?[\d.]+$', val):
+                    bm[field] = float(val)
+                elif val.isdigit():
+                    bm[field] = int(val)
+                else:
                     bm[field] = val
+            except:
+                bm[field] = val
 
         # Use mean_e2e_latency as tpot fallback
         if "mean_e2e_latency" in bm and "tpot" not in bm:
@@ -414,13 +445,67 @@ def extract_config_from_file(filepath):
         nn = _get_nnodes(config.get("other_args", []))
         config["is_multi_node"] = (nn > 1)
 
-    # Override quantization: if no --quantization in args, it's BF16
+    # Override quantization: if no --quantization in args, it's BF16.
     all_args = (config.get("prefill_args", []) + config.get("decode_args", []) +
                 config.get("other_args", []))
     if "--quantization" not in all_args:
         config["quantization"] = "BF16"
 
+    # Cross-validate with model path constant name and resolved path.
+    mp_quant = _parse_quant_from_model_path(source)
+    if mp_quant and config["quantization"].upper() != mp_quant.upper():
+        config["quantization"] = mp_quant
+
     return config
+
+
+_model_path_map = None
+
+
+def _get_model_path_map():
+    """Read test_npu_performance_utils.py, return {VARNAME: path_string} for *_MODEL_PATH."""
+    global _model_path_map
+    if _model_path_map is not None:
+        return _model_path_map
+
+    utils_path = os.path.normpath(os.path.join(
+        os.path.dirname(PERFORMANCE_DIR),
+        "..", "..", "..", "python", "sglang", "test", "ascend", "e2e",
+        "test_npu_performance_utils.py",
+    ))
+    _model_path_map = {}
+    try:
+        with open(utils_path, "r", encoding="utf-8") as f:
+            utils_source = f.read()
+        tree = ast.parse(utils_source)
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id.endswith("_MODEL_PATH"):
+                        _model_path_map[target.id] = _node_to_str(node.value)
+    except Exception:
+        pass
+    return _model_path_map
+
+
+def _parse_quant_from_model_path(source):
+    """Extract quantization (W4A8, W8A8, BF16) from model path info."""
+    # 1. Variable name: DEEPSEEK_R1_W4A8_PER_CHANNEL_MODEL_PATH
+    m = re.search(r'(\w+_(?:W4A8|W8A8|BF16)\w*)_MODEL_PATH\b', source)
+    if m:
+        token = m.group(1)
+        if "W4A8" in token: return "W4A8 INT8"
+        if "W8A8" in token: return "W8A8 INT8"
+        if "BF16" in token: return "BF16"
+
+    # 2. Resolved path string from utils: /.../MiMo-V2-Flash-W8A8/
+    for var_name, path_str in _get_model_path_map().items():
+        if var_name in source and path_str:
+            for q, label in [("W8A8", "W8A8 INT8"), ("W4A8", "W4A8 INT8"), ("BF16", "BF16")]:
+                if re.search(rf'[_-]{q}[/"\'\\]|{q}$', str(path_str), re.IGNORECASE):
+                    return label
+            break
+    return None
 
 
 def parse_pd_node_counts(filename):
@@ -447,13 +532,35 @@ def parse_cards_from_filename(filename):
     return 1
 
 
+def _env_value_needs_quoting(v):
+    """Return True if an env value needs to be wrapped in quotes for bash.
+
+    Values containing shell metacharacters (e.g. ``;``, spaces, ``<>``) would
+    otherwise break the ``export KEY=value`` statement or trigger unintended
+    shell behavior (command separation, redirection, globbing, ...).
+    """
+    if v == "":
+        return False
+    # Placeholder values like ``<network-interface>`` are meant to be replaced
+    # by the user — quoting them is unnecessary noise.
+    if v.startswith("<") and v.endswith(">"):
+        return False
+    # Safe characters that never need quoting in an export value.
+    return bool(re.search(r'[^A-Za-z0-9_./:=,@%+-]', v))
+
+
 def format_env_exports(envs):
     lines = []
     for k, v in sorted(envs.items()):
+        if k in EXCLUDED_ENV_VARS:
+            continue
         # Clean up f-string residuals and variable refs in values
         v = re.sub(r'\{[A-Z][A-Z0-9_]*\}', 'xxx', v)
         # Clean up trailing colon from collapsed f-strings
         v = re.sub(r':\s*$', '', v)
+        if _env_value_needs_quoting(v):
+            # Escape any embedded double quotes before wrapping.
+            v = '"' + v.replace('"', '\\"') + '"'
         lines.append(f"export {k}={v}")
     return "\n".join(lines)
 
@@ -468,20 +575,62 @@ def _resolve_var_name(val):
         return "$DRAFT_MODEL_PATH"
     return val
 
+def _arg_value_needs_quoting(v):
+    """Return True if a CLI argument value needs to be wrapped in quotes for bash.
+
+    Values containing shell metacharacters (spaces, braces, quotes, ``;``, ``$``,
+    etc.) would otherwise be split or interpreted by the shell.
+    """
+    if v == "":
+        return False
+    # Bash variable references (e.g. ``$DRAFT_MODEL_PATH``) must not be quoted
+    # — single quotes would prevent expansion.
+    if v.startswith("$"):
+        return False
+    return bool(re.search(r'[^A-Za-z0-9_./:=,@%+-]', v))
+
+
+def _quote_arg_value(v):
+    """Wrap a CLI argument value in single quotes for bash.
+
+    Single quotes are preferred over double quotes for values that may contain
+    JSON (which uses double quotes internally). Embedded single quotes are
+    handled via the standard ``'\\''`` escape sequence.
+    """
+    return "'" + v.replace("'", "'\\''") + "'"
+
+
 def format_args_for_bash(args, indent=""):
     """Format a list of args into bash command line arguments."""
     # Filter out None values
     args = [a for a in args if a is not None]
     # Resolve Python variable names in arguments
     parts = []
+    seen_flags = set()
     i = 0
     while i < len(args):
         arg = args[i]
         if arg.startswith("--"):
+            if arg in EXCLUDED_ARGS:
+                # Skip the flag and its value.
+                i += 1
+                while i < len(args) and args[i] and not args[i].startswith("--"):
+                    i += 1
+                continue
+            if arg in seen_flags:
+                # Deduplicate repeated flags — keep the first occurrence.
+                i += 1
+                while i < len(args) and args[i] and not args[i].startswith("--"):
+                    i += 1
+                continue
+            seen_flags.add(arg)
             flag_parts = [arg]
             i += 1
             while i < len(args) and args[i] and not args[i].startswith("--"):
-                flag_parts.append(_resolve_var_name(args[i]))
+                val = _resolve_var_name(args[i])
+                if _arg_value_needs_quoting(val):
+                    val = _quote_arg_value(val)
+                flag_parts.append(val)
                 i += 1
             parts.append(" ".join(flag_parts))
         else:
@@ -789,6 +938,10 @@ def format_pd_separate_command(config):
         "",
     ]
     for k, v in sorted(router_envs.items()):
+        if k in EXCLUDED_ENV_VARS:
+            continue
+        if _env_value_needs_quoting(v):
+            v = '"' + v.replace('"', '\\"') + '"'
         router_lines.append(f"export {k}={v}")
     router_args_str = " "
     if router_args:
@@ -969,13 +1122,14 @@ def format_benchmark_command(config):
         "--port 6688",
     ]
 
+    # GSP dataset needs special handling.
     if dataset_name == "generated-shared-prefix":
         repeat_rate = float(bm.get("repeat_rate", 0.9))
         input_len = int(bm.get("input_len", 0))
         output_len = int(bm.get("output_len", 0))
         num_prompts = int(bm.get("num_prompts", 0))
-        gsp_system_prompt_len = int(repeat_rate * input_len)
-        gsp_question_len = int((1 - repeat_rate) * input_len)
+        gsp_system_prompt_len = round(repeat_rate * input_len)
+        gsp_question_len = round((1 - repeat_rate) * input_len)
         parts.append("--gsp-num-groups 1")
         if num_prompts:
             parts.append(f"--gsp-prompts-per-group {num_prompts}")
@@ -991,35 +1145,86 @@ def format_benchmark_command(config):
             parts.append(f"--num-prompts {num_prompts}")
         if "request_rate" in bm:
             parts.append(f"--request-rate {safe_val(bm['request_rate'])}")
-    else:
-        if "max_concurrency" in bm:
-            parts.append(f"--max-concurrency {safe_val(bm['max_concurrency'])}")
-        if "input_len" in bm:
-            parts.append(f"--random-input-len {safe_val(bm['input_len'])}")
-        if "output_len" in bm:
-            parts.append(f"--random-output-len {safe_val(bm['output_len'])}")
-        if "num_prompts" in bm:
-            parts.append(f"--num-prompts {safe_val(bm['num_prompts'])}")
-        if "random_range_ratio" in bm:
-            parts.append(f"--random-range-ratio {safe_val(bm['random_range_ratio'])}")
-        if "request_rate" in bm:
-            parts.append(f"--request-rate {safe_val(bm['request_rate'])}")
-        if "warmup_requests" in bm:
-            parts.append(f"--warmup-requests {safe_val(bm['warmup_requests'])}")
-        if dataset_name == "image":
-            if "image_count" in bm:
-                parts.append(f"--image-count {safe_val(bm['image_count'])}")
-            if "image_resolution" in bm:
-                parts.append(f"--image-resolution {safe_val(bm['image_resolution'])}")
+        if "seed" in bm:
+            parts.append(f"--seed {safe_val(bm['seed'])}")
+        return " \\\n    ".join(parts)
+
+    # Dynamic benchmark flag mapping.
+    #  - Keys with a string value → explicit ``--flag``.
+    #  - Keys with a ``_flag`` entry → override the auto-generated flag name.
+    #  - Any other key in ``bm`` (not listed below) is auto-mapped:
+    #    ``field_name`` → ``--field-name``.
+    _BM_FLAG_MAP = {
+        "random_range_ratio": "--random-range-ratio",
+        "input_len":          "--random-input-len",
+        "output_len":         "--random-output-len",
+        "warmup_requests":    "--warmup-requests",
+        "request_rate":       "--request-rate",
+        "num_prompts":        "--num-prompts",
+        "max_concurrency":    "--max-concurrency",
+        "seed":               "--seed",
+    }
+
+    # Image-specific flags.
+    if dataset_name == "image":
+        _BM_FLAG_MAP["image_count"] = "--image-count"
+        _BM_FLAG_MAP["image_resolution"] = "--image-resolution"
+
+    # Fields that should never appear in the benchmark command.
+    _skip = {
+        "repeat_rate", "tpot", "ttft", "mean_e2e_latency",
+        "output_token_throughput", "dataset_name", "backend", "dataset_type",
+        "model", "model_path", "other_args", "envs", "model_config",
+        "other_envs", "model_type",
+    }
+
+    for key, val in bm.items():
+        if key in _skip:
+            continue
+        if val is None or val == "":
+            continue
+        if key in _BM_FLAG_MAP:
+            flag = _BM_FLAG_MAP[key]
+        else:
+            # Auto-derive flag name: foo_bar → --foo-bar
+            flag = "--" + key.replace("_", "-")
+        parts.append(f"{flag} {safe_val(val)}")
 
     return " \\\n    ".join(parts)
+
+
+def _get_sort_metric(bm):
+    """Return the primary latency metric value for category ordering."""
+    if "tpot" in bm:
+        return bm["tpot"]
+    if "ttft" in bm:
+        return bm["ttft"]
+    return 999
+
+
+def _get_metric_display(bm):
+    """Return (tpot_str, ttft_str) for display in tables and headings."""
+    tpot_val = bm.get("tpot")
+    ttft_val = bm.get("ttft")
+    tpot_str = f"{tpot_val}ms" if tpot_val is not None else ""
+    if ttft_val is not None:
+        # ttft values are in ms; display as "s" when >= 1000
+        ttft_str = f"{ttft_val / 1000:.3g}s" if ttft_val >= 1000 else f"{ttft_val}ms"
+    else:
+        ttft_str = ""
+    return tpot_str, ttft_str
+
+
+def _has_ttft(configs):
+    """Return True if any config in the list has a ttft field (even alongside tpot)."""
+    return any("ttft" in c.get("benchmark", {}) for c in configs)
 
 
 def generate_anchor(heading):
     """Generate anchor from heading text, matching Docusaurus auto-generated slug."""
     slug = heading.lower()
     slug = slug.replace(".", "-")
-    slug = re.sub(r'[^a-z0-9\s-]', '', slug)
+    slug = re.sub(r'[^a-z0-9_\s-]', '', slug)
     slug = re.sub(r'\s+', '-', slug)
     slug = re.sub(r'-{2,}', '-', slug)
     slug = slug.strip('-')
@@ -1049,6 +1254,7 @@ def generate_heading_label(config, model_name, model_dir):
         config_part = re.sub(r'_\d+(?:\.\d+)?ms$', f'_{tpot_str}ms', config_part)
     config_part = config_part.upper().replace("_", " ")
     config_part = re.sub(r'(\d+)MS', r'\1ms', config_part)
+    config_part = re.sub(r'(\d+)S\b', r'\1s', config_part)
     heading = f"{model_name} {config_part}"
     return heading
 
@@ -1063,19 +1269,60 @@ def build_model_document(model_dir, configs):
     lines.append(f'  description: "Best Practice for {model_name} on Ascend NPU"')
     lines.append("---")
     lines.append("")
-    lines.append(f"This guide describes the best practice data for {model_name} on the Ascend NPU.")
+
+    # Link to the corresponding model tutorial (user journey) when it exists.
+    tutorial_slug = get_tutorial_slug(model_dir)
+    tutorial_path = os.path.normpath(
+        os.path.join(OUTPUT_DIR, "..", "model-tutorials", f"{tutorial_slug}.mdx")
+    )
+    has_tutorial = os.path.isfile(tutorial_path)
+    tutorial_url = f"/docs/hardware-platforms/ascend-npus/model-tutorials/{tutorial_slug}"
+
+    if has_tutorial:
+        lines.append("<Note>")
+        lines.append(
+            f"This page focuses on optimal configuration and benchmark results for {model_name} on the Ascend NPU. "
+            f"For environment setup, model weight download, feature configuration, and deployment instructions, etc., "
+            f"see the [{model_name} Model Tutorial]({tutorial_url})."
+        )
+        lines.append("")
+        lines.append(
+            "On A3 each card has 2 dies, so `--tp-size` is twice the card count; "
+            "see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details."
+        )
+        lines.append("</Note>")
+    else:
+        lines.append("<Note>")
+        lines.append(
+            f"This page focuses on optimal configuration and benchmark results for {model_name} on the Ascend NPU."
+        )
+        lines.append("")
+        lines.append(
+            "On A3 each card has 2 dies, so `--tp-size` is twice the card count; "
+            "see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details."
+        )
+        lines.append("</Note>")
     lines.append("")
 
-    # Separate configs by category
-    low_latency = [c for c in configs if c["benchmark"].get("tpot", 999) < 30]
-    high_throughput = [c for c in configs if c["benchmark"].get("tpot", 999) >= 30]
+    # Separate configs by category.
+    # TTFT configs always go to High Throughput (they measure first-token latency,
+    # not per-token latency).
+    low_latency = [c for c in configs if "tpot" in c.get("benchmark", {})
+                   and c["benchmark"]["tpot"] < 30]
+    high_throughput = [c for c in configs if c not in low_latency]
+
+    has_ttft = _has_ttft(low_latency + high_throughput)
 
     def write_table(configs_list, title):
         if not configs_list:
             return
+
         lines.append(f"### {title}")
         lines.append("")
-        headers = ["Model", "Hardware", "Cards", "Deploy Mode", "Dataset", "TPOT", "Quantization", "Configuration"]
+        headers = ["Model", "Hardware", "Cards", "Deploy Mode", "Dataset", "TPOT"]
+        if has_ttft:
+            headers.append("TTFT")
+        headers += ["Quantization", "Configuration"]
         # Header row
         lines.append("| " + " | ".join(headers) + " |")
         # Separator row
@@ -1085,8 +1332,9 @@ def build_model_document(model_dir, configs):
             anchor = generate_anchor(heading_label)
             bm = c.get("benchmark", {})
             dataset = parse_dataset_from_filename(c.get("filename", ""))
-            tpot_val = bm.get("tpot", "N/A")
-            tpot_str = f"{tpot_val}ms" if tpot_val != "N/A" else "N/A"
+            tpot_str, ttft_str = _get_metric_display(bm)
+            tpot_str = tpot_str or "-"
+            ttft_str = ttft_str or "-"
 
             cells = [
                 model_name,
@@ -1095,6 +1343,10 @@ def build_model_document(model_dir, configs):
                 c.get("deploy_mode", "PD Mixed"),
                 dataset,
                 tpot_str,
+            ]
+            if has_ttft:
+                cells.append(ttft_str)
+            cells += [
                 c.get("quantization", "W8A8 INT8"),
                 f"[Optimal Configuration](#{anchor})",
             ]
@@ -1109,23 +1361,37 @@ def build_model_document(model_dir, configs):
     lines.append("")
 
     seen_anchor_types = set()
+
+    # Determine PD disaggregation anchor placement:
+    #  - prefer multi-node PD -> anchor before first multi-node PD config.
+    #  - fall back to single-node PD -> anchor before first single-node PD config.
+    has_multi_pd = any(c.get("is_pd_separate") and c.get("is_multi_node") for c in configs)
+    has_single_pd = any(c.get("is_pd_separate") and not c.get("is_multi_node") for c in configs)
+    pd_anchor_emitted = False
+
     for c in configs:
         bm = c.get("benchmark", {})
         dataset = parse_dataset_from_filename(c.get("filename", ""))
-        tpot_val = bm.get("tpot", "N/A")
-        tpot_str = f"{tpot_val}ms" if tpot_val != "N/A" else "N/A"
         heading_label = generate_heading_label(c, model_name, model_dir)
+        tpot_str, ttft_str = _get_metric_display(bm)
 
         is_sep = c.get("is_pd_separate", False)
         is_multi = c.get("is_multi_node", False)
         if is_sep:
-            anchor_type = "pd-disaggregation"
+            if has_multi_pd:
+                # Anchor before first multi-node PD disaggregation.
+                anchor_type = "pd-disaggregation" if (is_multi and not pd_anchor_emitted) else None
+            else:
+                # No multi-node PD -> anchor before first single-node PD disaggregation.
+                anchor_type = "pd-disaggregation" if (not is_multi and not pd_anchor_emitted) else None
+            if anchor_type:
+                pd_anchor_emitted = True
         elif is_multi:
             anchor_type = "multi-node-pd-mixed"
         else:
             anchor_type = "single-node-pd-mixed"
 
-        if anchor_type not in seen_anchor_types:
+        if anchor_type and anchor_type not in seen_anchor_types:
             lines.append(f'<a id="{anchor_type}" title="Referenced by external docs. Verify before removing."></a>')
             lines.append("")
             seen_anchor_types.add(anchor_type)
@@ -1147,7 +1413,12 @@ def build_model_document(model_dir, configs):
             lines.append("")
             lines.append("*Format: resolution (input tokens) + output tokens*")
         lines.append("")
-        lines.append(f"**TPOT**: {tpot_str}")
+        if tpot_str:
+            lines.append(f"**TPOT**: {tpot_str}")
+            if ttft_str:
+                lines.append("")
+        if ttft_str:
+            lines.append(f"**TTFT**: {ttft_str}")
         lines.append("")
 
         lines.append("#### Model Deployment")
@@ -1164,7 +1435,7 @@ def build_model_document(model_dir, configs):
         lines.append("")
 
         if router_cmd:
-            lines.append("```shell Command")
+            lines.append("```bash Command")
             lines.append(router_cmd.rstrip())
             lines.append("```")
             lines.append("")
@@ -1176,11 +1447,11 @@ def build_model_document(model_dir, configs):
             repeat_rate = float(c.get("benchmark", {}).get("repeat_rate", 0.9))
             input_len = int(c.get("benchmark", {}).get("input_len", 0))
             pct = int(repeat_rate * 100)
-            gsp_system_prompt_len = int(repeat_rate * input_len)
-            gsp_question_len = int((1 - repeat_rate) * input_len)
+            gsp_system_prompt_len = round(repeat_rate * input_len)
+            gsp_question_len = round((1 - repeat_rate) * input_len)
             desc = f"We tested it based on the `{dataset_name}` dataset with {pct}% cache hit (`repeat_rate = {repeat_rate}`):\n"
-            desc += f"`--gsp-system-prompt-len {gsp_system_prompt_len}` = `int({input_len} * {repeat_rate})` is the shared prefix portion.\n"
-            desc += f"`--gsp-question-len {gsp_question_len}` = `int({input_len} * (1 - {repeat_rate}))` is the unique per-request suffix.\n"
+            desc += f"`--gsp-system-prompt-len {gsp_system_prompt_len}` = `round({input_len} * {repeat_rate})` is the shared prefix portion.\n"
+            desc += f"`--gsp-question-len {gsp_question_len}` = `round({input_len} * (1 - {repeat_rate}))` is the unique per-request suffix.\n"
             desc += f"`--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse."
         elif dataset_name == "image":
             resolution = c.get("benchmark", {}).get("image_resolution", "")
@@ -1192,7 +1463,7 @@ def build_model_document(model_dir, configs):
             desc = f"We tested it based on the `{dataset_name.upper()}` dataset."
         lines.append(desc)
         lines.append("")
-        lines.append("```shell Command")
+        lines.append("```bash Command")
         lines.append(format_benchmark_command(c))
         lines.append("```")
         lines.append("")
@@ -1224,7 +1495,7 @@ def main():
             continue
 
         # Only include configs that have benchmark parameters (skip accuracy tests)
-        valid_configs = [c for c in configs if c.get("benchmark", {}).get("tpot")]
+        valid_configs = [c for c in configs if c.get("benchmark", {}).get("tpot") or c.get("benchmark", {}).get("ttft")]
         if not valid_configs:
             print(f"No valid benchmark configs for {model_dir}")
             continue
